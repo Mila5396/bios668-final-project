@@ -1,0 +1,249 @@
+---
+title: "Single-nucleus RNA-seq Analysis of the Human Dorsolateral Prefrontal Cortex in Alcohol Use Disorder"
+author: "Milagros Galán Llario"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+    number_sections: true
+  word_document:
+    toc: true
+    number_sections: true
+bibliography: references.bib
+link-citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5)
+```
+
+```{r libraries, include=FALSE}
+# Load required libraries
+library(Seurat)
+library(harmony)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(SingleR)
+library(scRNAseq)
+library(SingleCellExperiment)
+library(scuttle)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggrepel)
+
+# GitHub repository: https://github.com/Mila5396/bios668-final-project
+```
+
+```{r load-data, include=FALSE}
+# Load the pre-processed, annotated Seurat object saved from the analysis pipeline
+brain <- readRDS(
+  "/lustre/home/galanllarimm/bios668/final_project/brain_final.rds"
+)
+
+# Load differential expression results
+all_de <- read.csv(
+  "/lustre/home/galanllarimm/bios668/final_project/DE_results_top3_celltypes.csv"
+)
+```
+
+------------------------------------------------------------------------
+
+# Introduction
+
+Alcohol use disorder (AUD) is a chronic relapsing neuropsychiatric condition affecting hundreds of millions of individuals worldwide, imposing profound public health, social, and economic burdens [@WHO2019]. Chronic alcohol exposure induces lasting neuroadaptations in circuits governing executive function and reward processing, and the dorsolateral prefrontal cortex (dlPFC) is a key locus of these changes [@Koob2016]. As the brain region mediating working memory, impulse control, and decision-making, the dlPFC is critically implicated in the compulsive drinking and relapse that define AUD.
+
+Until recently, molecular studies of postmortem human brain tissue in AUD relied on bulk RNA-sequencing, which averages transcriptional signals across the highly heterogeneous cellular composition of brain tissue. This approach inevitably obscures cell-type-specific molecular changes that may be central to the disease. The development of single-nucleus RNA-sequencing (snRNA-seq) has overcome this limitation by enabling genome-wide transcriptomic profiling of individual nuclei isolated from frozen postmortem tissue, making it ideally suited for human brain research [@Lake2016].
+
+A comprehensive recent study by Warden et al. applied snRNA-seq to postmortem dlPFC samples from 36 individuals with AUD and 37 neurotypical controls, profiling over 459,000 nuclei across 73 samples [@Warden2026]. That study identified 32 distinct cell clusters and found that transcriptomic dysregulation in AUD was widespread but concentrated most heavily in glial populations—particularly novel astrocytic and microglial subtypes—with enrichment of inflammatory gene signatures and pathway-level changes in glutamate signaling. The dataset (GEO accession GSE247416) represents an invaluable public resource for interrogating the cell-type-specific molecular basis of AUD in the human brain.
+
+The present study performs an independent re-analysis of two samples drawn from this dataset—one AUD case (AUD_Sample46) and one neurotypical control (Control_Sample50)—to implement and evaluate a complete snRNA-seq analysis pipeline. Our objectives were to recover the major brain cell types present in the dlPFC, perform differential expression analysis within the three most abundant cell types, and characterize the biological pathways altered in AUD, with particular focus on glial biology and glutamate handling.
+
+------------------------------------------------------------------------
+
+# Methods
+
+## Data Retrieval and Read Processing
+
+Raw FASTQ files were obtained from the NCBI Gene Expression Omnibus under accession GSE247416 [@Warden2026]. Two samples were selected for analysis: AUD_Sample46, representing an individual with AUD, and Control_Sample50, a neurotypical control. Read alignment and cell barcode calling were performed using CellRanger 8.0.1 (10x Genomics) with the GRCh38-2020-A human reference genome, generating filtered feature-barcode matrices for each sample.
+
+## Quality Control and Filtering
+
+Seurat objects (v5.4.0) were created for each sample independently, requiring each gene to be detected in at least 3 cells and each nucleus to express at least 200 features [@Stuart2019]. Mitochondrial (MT-) read percentages were calculated. Nuclei were retained if they expressed between 200 and 6,000 genes per nucleus; the upper threshold removes likely doublets, while the lower removes empty droplets. 
+
+QC thresholds for mitochondrial content were determined by visual inspection of violin plots for each sample separately, as the two samples showed different distributions. AUD_Sample46 exhibited a tight distribution below 5% and was filtered with a strict threshold of \< 5% MT. Control_Sample50 exhibited a broader distribution extending to approximately 80%, likely reflecting differences in postmortem interval or tissue quality; a more permissive threshold of \< 20% MT was applied to retain a sufficient number of high-quality control nuclei for comparative analysis.
+
+## Normalization, Integration, and Dimensionality Reduction
+
+Each sample was normalized independently using SCTransform, which models count data with a regularized negative binomial regression to correct for sequencing depth while preserving biological variation [@Hafemeister2019]; the percentage of mitochondrial reads was included as a regression covariate. The three thousand most variable integration features were selected across objects. After merging the two Seurat objects, data were scaled and PCA was run on 50 components. Batch effects between samples were corrected using Harmony, applied to the first 30 PCA embeddings [@Korsunsky2019].
+
+## Clustering and Cell Type Annotation
+
+A shared nearest-neighbor graph was constructed on the Harmony-corrected embeddings using the first 30 dimensions, and clusters were identified with the Louvain algorithm at resolution 0.5. UMAP was generated from Harmony embeddings. Cluster marker genes were identified with `FindAllMarkers` (Wilcoxon rank-sum test; min.pct = 0.25; log2FC threshold = 0.25; positive markers only). Cell type identity was assigned by cross-referencing top marker genes against a curated panel of canonical brain cell type markers for eight major populations: excitatory neurons (*SLC17A7*, *CAMK2A*, *NRGN*), inhibitory neurons (*GAD1*, *GAD2*, *SLC32A1*), astrocytes (*GFAP*, *AQP4*, *SLC1A2*), oligodendrocytes (*MBP*, *MOG*, *OLIG2*), OPCs (*PDGFRA*, *VCAN*), microglia (*CX3CR1*, *P2RY12*), endothelial cells (*CLDN5*, *FLT1*), and pericytes (*PDGFRB*, *RGS5*). Annotations were independently validated at the cluster level using SingleR v2.8.0 with the Darmanis adult human brain reference [@Aran2019; @Darmanis2015].
+
+## Differential Expression and Functional Enrichment Analysis
+
+Differential expression between AUD and Control nuclei was performed within the three most abundant cell types (oligodendrocytes, astrocytes, and excitatory neurons) using `FindMarkers` on the log-normalized RNA assay (Wilcoxon rank-sum test; min.pct = 0.10; log2FC threshold = 0.10) [@Stuart2019]. Mitochondrial genes were excluded prior to testing because their differential expression in this dataset reflects differences in sample quality rather than biological variation. Genes were classified as significantly upregulated in AUD (padj \< 0.05, log2FC \> 0.25) or upregulated in Control (padj \< 0.05, log2FC \< −0.25). Because only one biological sample was available per condition, pseudobulk differential expression approaches requiring biological replicates could not be applied; all results should therefore be considered exploratory. Over-representation analysis (ORA) was performed separately on up- and downregulated gene sets using `enrichGO` (GO Biological Process ontology) and `enrichKEGG`, both implemented in clusterProfiler v4.14.6 [@Wu2021], with Benjamini-Hochberg multiple testing correction applied (adjusted p-value \< 0.05).
+
+------------------------------------------------------------------------
+
+# Results
+
+## Cell Filtering and Quality Metrics
+
+After quality filtering, 5,860 nuclei were retained from AUD_Sample46 and 4,151 from Control_Sample50, yielding a combined dataset of 10,011 nuclei for integration and downstream analysis. Post-filtering distributions confirmed appropriate QC thresholds: nFeature_RNA was concentrated below 5,000 genes per nucleus in both samples, and mitochondrial percentages were constrained within their respective thresholds.
+
+## UMAP Visualization and Cell Type Identification
+
+```{r fig-umap-annotated, fig.cap="**Figure 1. Annotated UMAP of 10,011 dlPFC nuclei.** Left: clusters colored and labeled by assigned cell type. Right: nuclei colored by sample of origin (AUD_Sample46 in orange, Control_Sample50 in teal), showing sample mixing after Harmony integration.", fig.width=12, fig.height=5}
+p1 <- DimPlot(brain, reduction = "umap", group.by = "cell_type",
+              label = TRUE, repel = TRUE, pt.size = 0.3) +
+      ggtitle("Annotated cell types") +
+      theme(legend.position = "bottom")
+
+p2 <- DimPlot(brain, reduction = "umap", group.by = "sample",
+              pt.size = 0.3) +
+      ggtitle("Sample of origin") +
+      theme(legend.position = "bottom")
+
+p1 | p2
+```
+
+Harmony integration substantially reduced the sample-driven separation visible in uncorrected PCA space, enabling joint clustering. At resolution 0.5, the Louvain algorithm identified 20 clusters, which were resolved into nine major cell populations through marker gene analysis and SingleR validation (Figure 1, Table 1): oligodendrocytes (n = 5,105; 51.0%), astrocytes (n = 1,401; 14.0%), excitatory neurons (n = 1,396; 13.9%), inhibitory neurons (n = 935; 9.3%), OPCs (n = 538; 5.4%), endothelial cells (n = 306; 3.1%), microglia (n = 230; 2.3%), pericytes (n = 54; 0.5%), and an immune-like population (n = 46; 0.5%) expressing *NKG7*, *PTPRC*, and *RHOH*. SingleR annotation agreed with manual labels for oligodendrocytes, astrocytes, OPCs, and endothelial cells; neuronal clusters received broad "neurons" labels, consistent with the limited neuronal resolution of the Darmanis reference.
+
+```{r table1, echo=FALSE}
+ct_counts <- table(brain$cell_type, brain$sample)
+ct_df <- as.data.frame.matrix(ct_counts)
+ct_df$Total <- rowSums(ct_df)
+ct_df$`% of Total` <- round(100 * ct_df$Total / sum(ct_df$Total), 1)
+knitr::kable(ct_df, caption = "**Table 1. Cell type composition per sample.**")
+```
+
+Four clusters required annotation correction: cluster 0 was reassigned from excitatory neurons to oligodendrocytes based on the dominant markers *MBP*, *MOG*, and *OLIG2*, consistent with oligodendrocytes being the most abundant glial population in the human dlPFC; cluster 3 was reassigned from inhibitory neurons to astrocytes based on *GFAP*, *AQP4*, and *SLC1A2* expression with no detectable *GAD1/GAD2* signal; cluster 4 was reassigned from astrocytes to OPCs based on the top marker *PDGFRA*; and cluster 19 was reassigned from astrocytes to excitatory neurons based on *HTR2C* and *NPSR1-AS1* expression, both confirmed by SingleR.
+
+## Cell Type Composition Across Conditions
+
+```{r fig-composition, fig.cap="**Figure 2. Proportional cell type composition per sample.** AUD_Sample46 is dominated by oligodendrocytes (~70%), while Control_Sample50 shows a more balanced distribution (~24% oligodendrocytes). This difference most likely reflects inter-individual sampling variability in a single-sample design rather than a robust biological effect.", fig.width=6, fig.height=5}
+prop_df <- as.data.frame(table(brain$cell_type, brain$sample))
+colnames(prop_df) <- c("CellType", "Sample", "Count")
+
+ggplot(prop_df, aes(x = Sample, y = Count, fill = CellType)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Cell type proportions per sample",
+       y = "Proportion", x = "Sample") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Cell type composition differed substantially between samples (Figure 2). Oligodendrocytes constituted approximately 70% of all nuclei in AUD_Sample46 (n = 4,090) but only 24% in Control_Sample50 (n = 1,015). This extreme imbalance likely reflects inter-individual variability inherent to a single-sample-per-condition design, and should not be interpreted as a reproducible biological finding without replication in larger cohorts.
+
+## Differential Expression in Astrocytes
+
+Differential expression analysis of astrocytes (n = 315 AUD, n = 1,086 Control) yielded 681 significantly differentially expressed genes (padj \< 0.05, \|log2FC\| \> 0.25), of which 397 were upregulated in AUD and 284 in Control. Among the most strongly downregulated genes in AUD astrocytes were *SLC1A2* (avg log2FC = −1.22), encoding the excitatory amino acid transporter GLT-1 and the primary transporter responsible for synaptic glutamate clearance; *SLC1A3* (avg log2FC = −1.49), encoding the GLAST transporter; and *GLUT* (avg log2FC = −2.33), encoding glutamine synthetase, which recycles astrocytic glutamate back into glutamine for neuronal reuse. Additional downregulated genes included the gap junction protein *GJA1* (connexin-43; log2FC = −2.05), and synaptic cell adhesion molecules *NRXN1* (log2FC = −1.69) and *ERBB4* (log2FC = −1.48). Genes upregulated in AUD astrocytes included *MALAT1* (log2FC = +1.28), *KCNIP4* (+2.48), *IL1RAPL1* (+2.51), and *CNTNAP2* (+2.54).
+
+```{r fig-volcano-astro, fig.cap="**Figure 3. Volcano plot of differential expression in astrocytes (AUD vs. Control).** Red points indicate genes significantly upregulated in AUD (padj < 0.05, log2FC > 0.25); blue points indicate genes upregulated in Control. Top 15 most significant genes are labeled.", fig.width=8, fig.height=6}
+de_astro <- all_de %>% filter(cell_type == "Astrocytes")
+
+top_genes <- de_astro %>%
+  filter(significance != "Not significant") %>%
+  arrange(p_val_adj) %>%
+  slice_head(n = 15)
+
+ggplot(de_astro, aes(x = avg_log2FC,
+                     y = -log10(p_val_adj + 1e-300),
+                     color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Up in AUD"     = "#E64B35",
+                                "Up in Control" = "#4DBBD5",
+                                "Not significant" = "grey70")) +
+  geom_text_repel(data = top_genes, aes(label = gene),
+                  size = 3, max.overlaps = 20, color = "black") +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  labs(title = "Volcano Plot – Astrocytes (AUD vs. Control)",
+       subtitle = "Wilcoxon test | padj < 0.05 & |log2FC| > 0.25",
+       x = "Average log2 Fold Change (AUD / Control)",
+       y = "-log10(adjusted p-value)",
+       color = "Direction") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", size = 13),
+        legend.position = "top")
+```
+
+GO Biological Process ORA of AUD-upregulated astrocyte genes identified 89 enriched terms, with the top hits being cell-cell signaling, trans-synaptic signaling, synaptic signaling, chemical synaptic transmission, and glutamate receptor signaling pathway (all padj \< 0.001). KEGG pathway analysis returned 12 enriched pathways for AUD-upregulated astrocyte genes, including cAMP signaling, neuroactive ligand-receptor interaction, glutamatergic synapse, dopaminergic synapse, amphetamine addiction, and long-term potentiation.
+
+```{r fig-kegg-astro, fig.cap="**Figure 4. KEGG pathway enrichment in AUD-upregulated astrocyte genes.** Over-representation analysis of genes significantly upregulated in AUD astrocytes (padj < 0.05, log2FC > 0.25) against the KEGG pathway database. Dot size reflects the number of genes in each pathway; color indicates adjusted p-value.", fig.width=8, fig.height=6}
+
+# Retrieve genes upregulated in AUD astrocytes
+astro_up <- all_de %>%
+  filter(cell_type == "Astrocytes",
+         significance == "Up in AUD") %>%
+  pull(gene)
+
+# Universe = all genes tested in astrocytes
+astro_universe <- all_de %>%
+  filter(cell_type == "Astrocytes") %>%
+  pull(gene)
+
+# Convert gene symbols to Entrez IDs
+gene_conv <- bitr(astro_up,
+                  fromType = "SYMBOL",
+                  toType   = "ENTREZID",
+                  OrgDb    = org.Hs.eg.db)
+
+universe_conv <- bitr(astro_universe,
+                      fromType = "SYMBOL",
+                      toType   = "ENTREZID",
+                      OrgDb    = org.Hs.eg.db)
+
+# Run KEGG over-representation analysis
+kk_astro <- enrichKEGG(
+  gene          = gene_conv$ENTREZID,
+  universe      = universe_conv$ENTREZID,
+  organism      = "hsa",
+  keyType       = "ncbi-geneid",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2
+)
+
+# Convert Entrez IDs back to gene symbols for readability
+kk_astro <- setReadable(kk_astro, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+# Plot
+dotplot(kk_astro, showCategory = 12, font.size = 10) +
+  ggtitle("KEGG Pathway Enrichment – Astrocytes (Up in AUD)") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+```
+
+## Differential Expression in Oligodendrocytes and Excitatory Neurons
+
+Oligodendrocyte differential expression (n = 4,090 AUD, n = 1,015 Control) yielded 2,015 significant genes, heavily skewed toward AUD upregulation (1,910 up in AUD, 105 up in Control). Given the extreme cell count imbalance between conditions in this cluster, these results require cautious interpretation. <GO:BP> enrichment of AUD-upregulated oligodendrocyte genes revealed significant terms related to chromatin organization, chromatin remodeling, mRNA metabolic process, and RNA splicing, with prominent involvement of chromatin remodeling factors including *SMARCA4*, *SMARCA2*, *ARID4B*, and multiple histone-modifying enzymes. No KEGG pathways were enriched in either direction for oligodendrocytes.
+
+In excitatory neurons (n = 563 AUD, n = 833 Control), 6,631 genes were significantly differentially expressed, predominantly upregulated in AUD (6,352 up in AUD, 279 up in Control). This broad upregulation pattern yielded minimal <GO:BP> enrichment (chromosome organization, ribonucleoprotein complex biogenesis), consistent with a non-specific transcriptional signature possibly inflated by pseudo-replication. KEGG analysis of AUD-upregulated excitatory neuron genes identified ribosome, coronavirus disease, and lysine degradation as enriched pathways, and the control-upregulated gene set was enriched in glutamatergic synapse, synaptic signaling, and IgSF CAM signaling.
+
+------------------------------------------------------------------------
+
+# Discussion
+
+This study demonstrates the feasibility of a reproducible snRNA-seq analysis pipeline applied to two samples from the Warden et al. dlPFC dataset, recovering nine biologically plausible cell populations and identifying putative transcriptional changes in AUD across multiple cell types. The most informative and biologically interpretable findings emerged from the astrocyte differential expression analysis.
+
+The downregulation of *SLC1A2* (GLT-1), *SLC1A3* (GLAST), and *GLUT* (glutamine synthetase) in AUD astrocytes represents a coherent molecular signature of impaired astrocytic glutamate homeostasis. GLT-1 is responsible for the clearance of approximately 90% of extracellular glutamate in the forebrain, and reduced GLT-1 expression has been consistently reported in preclinical models of alcohol dependence, where it is linked to glutamate spillover, increased postsynaptic excitatory drive, and withdrawal-related hyperexcitability. The simultaneous downregulation of GLUT (which converts glutamate to glutamine in the glutamate-glutamine cycle) further suggests disruption of the metabolic coupling between astrocytes and glutamatergic neurons in AUD. These findings are reinforced by the GO and KEGG enrichment of AUD-upregulated astrocyte genes in synaptic signaling, glutamate receptor signaling, and glutamatergic synapse pathways, suggesting a complex transcriptional response in which impaired astrocytic glutamate uptake coexists with compensatory upregulation of receptor-associated signaling cascades.
+
+These results partially converge with the findings of Warden et al. [@Warden2026], who identified astrocytic subtypes as among the most transcriptomically dysregulated populations in AUD, with enrichment of inflammatory gene signatures and pathway-level changes in glial function. While our analysis lacked the statistical power and resolution to identify novel astrocyte subtypes as in the original study—which used 73 samples and pseudobulk approaches—the shared emphasis on astrocytic dysregulation as a central feature of AUD in the dlPFC provides biological coherence to our results.
+
+The enrichment of chromatin organization and remodeling terms in oligodendrocyte AUD-upregulated genes, driven notably by the BAF complex subunits *SMARCA4* (BRG1) and *SMARCA2* (BRM), raises the possibility of epigenetic remodeling in oligodendrocyte lineage cells in the context of chronic alcohol exposure. However, the dramatic compositional imbalance between samples in this cluster (70% vs. 24% oligodendrocytes) severely limits confidence in the oligodendrocyte DE results, as differential power between groups substantially inflates false positives in Wilcoxon-based testing.
+
+Several critical limitations must be acknowledged. The use of a single biological sample per condition is the primary constraint of this study: no statistical separation of biological from technical variability is possible, and the observed differences for any given cell type could reflect inter-individual variation rather than condition-specific biology. This also precludes pseudobulk methods, which aggregate counts to the donor level before applying conventional bulk DE statistics and represent the current best practice for single-cell DE analysis across conditions. Second, the differing mitochondrial thresholds applied to the two samples may have introduced systematic biases in the retained cell populations. Third, the extreme oligodendrocyte imbalance between samples likely reflects sampling stochasticity rather than AUD biology. Future work should apply this pipeline to the complete GSE247416 dataset using pseudobulk methods to generate robust, reproducible findings.
+
+In conclusion, this analysis recovers the major cellular architecture of the human dlPFC from snRNA-seq data and identifies a potentially meaningful molecular signature of AUD in astrocytes, characterized by downregulation of glutamate transporter genes and compensatory upregulation of synaptic signaling pathways. These findings are consistent with a broader literature implicating astrocytic glutamate dysregulation in the neurophysiology of alcohol dependence, and encourage future investigation with adequately powered, multi-sample designs.
+
+------------------------------------------------------------------------
+
+# References

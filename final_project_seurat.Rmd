@@ -1,0 +1,564 @@
+---
+title: "Final Project: snRNA-seq Analysis of Human Alcohol-Dependent Brain"
+author: "Milagros Galán Llario"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 7)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+library(Seurat)
+library(harmony)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(SingleR)
+library(scRNAseq)
+library(SingleCellExperiment)
+library(scuttle)
+```
+
+# 2. Load Data and Create Seurat Objects
+
+We load the CellRanger output for each sample and create individual Seurat objects.
+
+```{r load-data}
+# Load AUD sample
+aud_counts <- Read10X(
+  data.dir = "/lustre/home/galanllarimm/bios668/final_project/AUD_Sample46/outs/filtered_feature_bc_matrix/"
+)
+
+aud <- CreateSeuratObject(
+  counts       = aud_counts,
+  project      = "AUD_Sample46",
+  min.cells    = 3,
+  min.features = 200
+)
+aud$sample    <- "AUD_Sample46"
+aud$condition <- "AUD"
+
+# Load Control sample
+ctrl_counts <- Read10X(
+  data.dir = "/lustre/home/galanllarimm/bios668/final_project/Control_Sample50/outs/filtered_feature_bc_matrix/"
+)
+
+ctrl <- CreateSeuratObject(
+  counts       = ctrl_counts,
+  project      = "Control_Sample50",
+  min.cells    = 3,
+  min.features = 200
+)
+ctrl$sample    <- "Control_Sample50"
+ctrl$condition <- "Control"
+
+cat("AUD cells before QC:    ", ncol(aud),  "\n")
+cat("Control cells before QC:", ncol(ctrl), "\n")
+```
+
+# 3. Quality Control
+
+We calculate QC metrics and visualize them to decide appropriate filtering thresholds.
+In snRNA-seq from frozen postmortem brain tissue, mitochondrial content is 
+naturally very low because we are sequencing nuclei, not whole cells.
+A threshold of <5% MT is appropriate for this type of data.
+
+```{r qc-metrics}
+# Calculate % mitochondrial reads
+aud[["percent.mt"]]  <- PercentageFeatureSet(aud,  pattern = "^MT-")
+ctrl[["percent.mt"]] <- PercentageFeatureSet(ctrl, pattern = "^MT-")
+
+# Calculate % ribosomal reads
+aud[["percent.rb"]]  <- PercentageFeatureSet(aud,  pattern = "^RP[SL]")
+ctrl[["percent.rb"]] <- PercentageFeatureSet(ctrl, pattern = "^RP[SL]")
+```
+
+```{r qc-plots-before, fig.height=5}
+# Visualize QC metrics BEFORE filtering to decide thresholds
+VlnPlot(aud,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3, pt.size = 0) +
+  plot_annotation(title = "QC Metrics – AUD_Sample46 (before filtering)")
+
+VlnPlot(ctrl,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3, pt.size = 0) +
+  plot_annotation(title = "QC Metrics – Control_Sample50 (before filtering)")
+```
+
+```{r qc-scatter}
+# Scatter plots to detect doublets
+FeatureScatter(aud,  feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  ggtitle("AUD: nCount vs nFeature")
+
+FeatureScatter(ctrl, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  ggtitle("Control: nCount vs nFeature")
+```
+
+```{r qc-filter}
+# Filter based on visual inspection of the plots above.
+# Thresholds chosen for snRNA-seq of frozen postmortem brain:
+# - nFeature_RNA > 200: remove empty droplets
+# - nFeature_RNA < 6000: remove likely doublets
+# - percent.mt < 5: appropriate for nuclear RNA from frozen tissue
+
+# AUD: strict threshold (good quality tissue)
+aud  <- subset(aud,  subset = nFeature_RNA > 200 &
+                               nFeature_RNA < 6000 &
+                               percent.mt  < 5)
+
+# Control: more permissive threshold based on visual inspection
+# of violin plots — this sample shows higher MT% distribution
+ctrl <- subset(ctrl, subset = nFeature_RNA > 200 &
+                               nFeature_RNA < 6000 &
+                               percent.mt  < 20)
+
+cat("AUD cells after QC:    ", ncol(aud),  "\n")
+cat("Control cells after QC:", ncol(ctrl), "\n")
+```
+
+```{r qc-plots-after, fig.height=5}
+# Violin plots after filtering to confirm QC worked
+VlnPlot(aud,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3, pt.size = 0) +
+  plot_annotation(title = "QC Metrics – AUD_Sample46 (after filtering)")
+
+VlnPlot(ctrl,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3, pt.size = 0) +
+  plot_annotation(title = "QC Metrics – Control_Sample50 (after filtering)")
+```
+
+# 4. Normalization with SCTransform
+
+SCTransform is the current standard normalization method for scRNA-seq data.
+Unlike LogNormalize, SCTransform uses a regularized negative binomial regression
+that corrects for technical variation (sequencing depth) while preserving
+biological signal. It also automatically identifies highly variable genes (HVGs).
+We regress out mitochondrial percentage to remove its confounding effect.
+
+Note: SCTransform is run on each sample separately before merging.
+
+```{r sctransform}
+aud  <- SCTransform(aud,  vars.to.regress = "percent.mt", verbose = FALSE)
+ctrl <- SCTransform(ctrl, vars.to.regress = "percent.mt", verbose = FALSE)
+```
+
+# 5. Merge Objects
+
+We merge both samples into a single Seurat object before integration.
+
+```{r merge}
+brain <- merge(aud, y = ctrl,
+               add.cell.ids = c("AUD", "CTRL"),
+               project = "BrainAUD",
+               merge.data = TRUE)
+
+# Set default assay to SCT
+DefaultAssay(brain) <- "SCT"
+
+# Select variable features for integration
+VariableFeatures(brain) <- SelectIntegrationFeatures(
+  object.list = list(aud, ctrl),
+  nfeatures = 3000
+)
+
+cat("Total cells after merge:", ncol(brain), "\n")
+table(brain$sample)
+```
+
+# 6. Dimensionality Reduction (PCA)
+
+```{r pca}
+# Scale and run PCA on the merged object
+brain <- ScaleData(brain, verbose = FALSE)
+brain <- RunPCA(brain, npcs = 50, verbose = FALSE)
+```
+
+```{r pca-plots}
+# Elbow plot to choose number of PCs to use downstream
+ElbowPlot(brain, ndims = 50) +
+  ggtitle("Elbow Plot – Choosing number of PCs")
+
+# PCA plot colored by sample (before integration)
+DimPlot(brain, reduction = "pca", group.by = "sample") +
+  ggtitle("PCA before Harmony integration")
+```
+
+# 7. Harmony Integration
+
+Harmony corrects for batch effects between samples while preserving biological
+variation. It works on the PCA embeddings without modifying the count matrix.
+
+```{r harmony}
+brain <- RunHarmony(brain,
+                    group.by.vars = "sample",
+                    dims.use      = 1:30,
+                    verbose       = TRUE)
+
+# Compare before and after integration
+p1 <- DimPlot(brain, reduction = "pca",     group.by = "sample") +
+        ggtitle("Before Harmony (PCA)")
+p2 <- DimPlot(brain, reduction = "harmony", group.by = "sample") +
+        ggtitle("After Harmony")
+
+p1 | p2
+```
+
+# 8. Clustering and UMAP
+
+```{r cluster-umap}
+# Build neighbor graph using Harmony embeddings
+brain <- FindNeighbors(brain, reduction = "harmony", dims = 1:30)
+
+# Test different resolutions to find the best number of clusters
+# Human dlPFC has ~8-10 major cell types
+brain <- FindClusters(brain, resolution = 0.3)
+cat("Clusters at resolution 0.3:", length(unique(brain$seurat_clusters)), "\n")
+
+brain <- FindClusters(brain, resolution = 0.5)
+cat("Clusters at resolution 0.5:", length(unique(brain$seurat_clusters)), "\n")
+
+brain <- FindClusters(brain, resolution = 0.8)
+cat("Clusters at resolution 0.8:", length(unique(brain$seurat_clusters)), "\n")
+
+# Set final resolution — adjust based on output above
+brain <- FindClusters(brain, resolution = 0.5)
+
+# Run UMAP using Harmony embeddings
+brain <- RunUMAP(brain, reduction = "harmony", dims = 1:30)
+```
+
+```{r umap-plots}
+# UMAP colored by cluster
+p_cluster <- DimPlot(brain, reduction = "umap",
+                     label = TRUE, repel = TRUE) +
+               ggtitle(paste0("UMAP – Seurat clusters (",
+                              length(unique(brain$seurat_clusters)),
+                              " clusters)"))
+
+# UMAP colored by sample
+p_sample <- DimPlot(brain, reduction = "umap",
+                    group.by = "sample") +
+              ggtitle("UMAP – colored by sample")
+
+p_cluster | p_sample
+```
+
+## 9. Find Cluster Markers
+
+Note: `FindConservedMarkers` requires sufficient cells per cluster in each
+sample. Due to sample size constraints in some clusters (e.g., Pericytes:
+n=17 in AUD_Sample46), this approach did not return results. We therefore
+used `FindAllMarkers`, which identifies marker genes for each cluster across
+the full merged dataset. This is the standard approach for datasets with a
+limited number of samples per condition.
+
+```{r find-markers, message=FALSE, warning=FALSE}
+DefaultAssay(brain) <- "SCT"
+brain <- PrepSCTFindMarkers(brain)
+
+all_markers <- FindAllMarkers(
+  brain,
+  only.pos        = TRUE,   # only upregulated markers per cluster
+  min.pct         = 0.25,   # gene must be detected in at least 25% of cluster cells
+  logfc.threshold = 0.25    # minimum log2FC threshold
+)
+
+# Top 5 markers per cluster ordered by avg_log2FC
+top_markers <- all_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5) %>%
+  select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj)
+
+print(top_markers, n = 100)
+```
+
+```{r marker-dotplot, fig.width=14, fig.height=6}
+# Top 2 markers per cluster for visualization
+top2_genes <- all_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 2) %>%
+  pull(gene) %>%
+  unique()
+
+DotPlot(brain, features = top2_genes, dot.scale = 6) +
+  RotatedAxis() +
+  ggtitle("Top 2 markers per cluster (FindAllMarkers)")
+```
+
+# 10. Cell Type Annotation
+
+## 10.1 Known brain cell type markers
+
+```{r known-markers}
+known_markers <- list(
+  Excitatory_Neurons = c("SLC17A7", "CAMK2A", "NRGN"),
+  Inhibitory_Neurons = c("GAD1", "GAD2", "SLC32A1"),
+  Astrocytes         = c("GFAP", "AQP4", "SLC1A2"),
+  Oligodendrocytes   = c("MBP", "MOG", "OLIG2"),
+  OPC                = c("PDGFRA", "VCAN", "CSPG4"),
+  Microglia          = c("CX3CR1", "P2RY12", "IBA1"),
+  Endothelial        = c("CLDN5", "FLT1", "PECAM1"),
+  Pericytes          = c("PDGFRB", "RGS5", "NOTCH3")
+)
+
+# Feature plots for each cell type
+for (ct in names(known_markers)) {
+  genes_present <- known_markers[[ct]][known_markers[[ct]] %in% rownames(brain)]
+  if (length(genes_present) > 0) {
+    p <- FeaturePlot(brain,
+                     features  = genes_present,
+                     reduction = "umap",
+                     ncol      = length(genes_present)) &
+           theme(legend.position = "right")
+    print(p + plot_annotation(title = paste("Markers:", ct)))
+  }
+}
+```
+
+```{r dotplot-known}
+all_known_present <- unlist(known_markers)
+all_known_present <- all_known_present[all_known_present %in% rownames(brain)]
+
+DotPlot(brain, features = all_known_present, dot.scale = 5) +
+  RotatedAxis() +
+  ggtitle("Known cell type markers across clusters")
+```
+
+### 10.2 Annotate clusters
+
+Based on the FindAllMarkers results from Section 9, the known marker FeaturePlots,
+and the SingleR validation performed in Section 10.4, we assign a cell type label
+to each cluster. Four clusters were corrected relative to the initial manual annotation:
+
+- **Cluster 0** was reassigned from Excitatory Neurons to **Oligodendrocytes**.
+  This is the largest cluster in the dataset. In the human dlPFC, oligodendrocytes
+  represent the most abundant glial population, making it biologically expected that
+  the largest cluster corresponds to this cell type. Moreover, in a well-resolved UMAP,
+  each cell type should form one spatially coherent region — the presence of "Excitatory
+  Neurons" spread across multiple distal clusters (including cluster 0 and several small
+  clusters on the opposite side of the UMAP) indicated a misannotation. Top markers for
+  cluster 0 include canonical oligodendrocyte genes (MBP, MOG, OLIG2), consistent with
+  the Oligodendrocyte label. The true Excitatory Neurons are represented by the smaller
+  clusters concentrated on the left side of the UMAP (clusters 8, 10, 12, 15, 16, 19).
+
+- **Cluster 3** was reassigned from Inhibitory Neurons to **Astrocytes**.
+  Inspection of top marker genes from FindAllMarkers and the known marker FeaturePlots
+  revealed expression of canonical astrocyte markers (GFAP, AQP4, SLC1A2) with no
+  detectable expression of inhibitory neuron markers (GAD1, GAD2, SLC32A1). SingleR
+  with the Darmanis adult brain reference also labeled this cluster as astrocytes,
+  consistent with the molecular evidence. It is merged with cluster 5 into the final
+  Astrocytes population.
+
+- **Cluster 4** was reassigned from Astrocytes to OPC (top marker PDGFRA, confirmed by SingleR).
+
+- **Cluster 19** was reassigned from Astrocytes to Excitatory Neurons (top markers
+  HTR2C and NPSR1-AS1, confirmed by SingleR).
+
+- **Cluster 18** was reassigned from Oligodendrocytes to Immune-like (top markers NKG7,
+  PTPRC, RHOH, SKAP1 — consistent with a lymphoid/immune identity and labeled "hybrid"
+  by SingleR with the Darmanis adult brain reference).
+
+```{r annotate-clusters}
+# Annotation vector — updated after SingleR validation in Section 10.4
+cluster_annotations <- c(
+  "0"  = "Oligodendrocytes",    # corrected from Excitatory Neurons per Dozmorov feedback:
+                                 # largest cluster → expected to be Oligodendrocytes in dlPFC;
+                                 # top markers MBP/MOG/OLIG2 confirm this;
+                                 # true Excitatory Neurons are the small clusters on the left (8,10,12,15,16,19)
+  "1"  = "Oligodendrocytes",
+  "2"  = "Oligodendrocytes",
+  "3"  = "Astrocytes",          # corrected from Inhibitory Neurons: markers show GFAP/AQP4/SLC1A2,
+                                 # no GAD1/GAD2/SLC32A1; SingleR also labels as astrocytes
+  "4"  = "OPC",                 # corrected from Astrocytes (PDGFRA top marker + SingleR OPC)
+  "5"  = "Astrocytes",
+  "6"  = "Excitatory Neurons",
+  "7"  = "Inhibitory Neurons",
+  "8"  = "Inhibitory Neurons",
+  "9"  = "Oligodendrocytes",
+  "10" = "Excitatory Neurons",
+  "11" = "Endothelial",
+  "12" = "Excitatory Neurons",
+  "13" = "Microglia",
+  "14" = "Inhibitory Neurons",
+  "15" = "Excitatory Neurons",
+  "16" = "Excitatory Neurons",
+  "17" = "Pericytes",
+  "18" = "Immune-like",         # corrected from Oligodendrocytes (NKG7/PTPRC/RHOH/SKAP1)
+  "19" = "Excitatory Neurons"   # corrected from Astrocytes (HTR2C/NPSR1-AS1 — neuronal markers)
+)
+
+# Map cluster numbers to cell type labels
+brain$cell_type <- unname(plyr::mapvalues(
+  x            = as.character(brain$seurat_clusters),
+  from         = names(cluster_annotations),
+  to           = unname(cluster_annotations),
+  warn_missing = FALSE
+))
+
+DimPlot(brain, reduction = "umap",
+        group.by = "cell_type",
+        label = TRUE, repel = TRUE) +
+  ggtitle("UMAP - Annotated cell types")
+```
+
+## 10.3 Merge clusters of the same cell type
+
+```{r merge-clusters}
+Idents(brain) <- "cell_type"
+
+DimPlot(brain, reduction = "umap",
+        label = TRUE, repel = TRUE) +
+  ggtitle("UMAP – Merged cell type clusters")
+
+cat("\nCell type counts:\n")
+table(brain$cell_type)
+
+cat("\nCell type composition per sample:\n")
+table(brain$cell_type, brain$sample)
+```
+### 10.4 Annotation validation with SingleR
+
+To independently validate our manual cluster annotations, we used SingleR
+(Aran et al., 2019) with the Darmanis adult human brain reference
+(Darmanis et al., 2015), obtained from the scRNAseq Bioconductor package.
+This reference contains well-characterized transcriptomic profiles for the
+major CNS cell types — neurons, astrocytes, oligodendrocytes, OPCs, microglia,
+and endothelial cells — making it appropriate for validating snRNA-seq data
+from postmortem human brain.
+
+The Seurat object was converted to SingleCellExperiment format and SingleR was
+applied at the cluster level rather than per cell, which is more appropriate
+when evaluating predefined clusters against reference labels. Because the Darmanis
+reference only contains raw counts, log-normalized counts were computed prior to
+classification. The resulting labels were compared with our manual annotations to
+identify any discrepant clusters and inform any necessary corrections.
+
+```{r singler-validation, message=FALSE, warning=FALSE}
+
+# Load Darmanis adult human brain reference
+darmanis <- DarmanisBrainData()
+
+# The reference only has raw counts — add log-normalized counts for SingleR
+if (!"logcounts" %in% assayNames(darmanis)) {
+  logcounts(darmanis) <- log2(counts(darmanis) + 1)
+}
+
+# Convert Seurat object to SingleCellExperiment
+# Note: conversion warnings about empty layers are expected with SCTransform objects
+sce <- as.SingleCellExperiment(brain)
+
+# Run SingleR at the cluster level using Darmanis as reference
+pred_darmanis <- SingleR(
+  test            = sce,
+  ref             = darmanis,
+  labels          = darmanis$cell.type,
+  clusters        = sce$seurat_clusters,
+  assay.type.test = "logcounts",
+  assay.type.ref  = "logcounts"
+)
+
+# Build comparison table: manual annotation vs SingleR prediction per cluster
+manual_df <- data.frame(
+  cluster = levels(brain$seurat_clusters),
+  manual  = sapply(levels(brain$seurat_clusters), function(cl) {
+    names(sort(table(brain$cell_type[brain$seurat_clusters == cl]),
+               decreasing = TRUE))[1]
+  })
+)
+
+darmanis_df <- data.frame(
+  cluster         = rownames(pred_darmanis),
+  singler_label   = pred_darmanis$labels,
+  singler_pruned  = pred_darmanis$pruned.labels
+)
+
+comparison <- merge(manual_df, darmanis_df, by = "cluster")
+comparison <- comparison[order(as.numeric(as.character(comparison$cluster))), ]
+
+cat("\nCluster annotation comparison: manual vs SingleR (Darmanis adult brain)\n")
+print(comparison, row.names = FALSE)
+
+# Save table
+write.csv(comparison,
+          file = "/lustre/home/galanllarimm/bios668/final_project/singler_comparison.csv",
+          row.names = FALSE)
+cat("\nComparison table saved.\n")
+```
+
+```{r singler-umap, fig.width=12, fig.height=5}
+# Add Darmanis SingleR predictions to Seurat object for visual comparison
+brain$singler_label <- pred_darmanis$labels[
+  match(as.character(brain$seurat_clusters), rownames(pred_darmanis))
+]
+
+# Side-by-side UMAP: manual annotation vs SingleR
+p_manual <- DimPlot(brain, reduction = "umap",
+                    group.by = "cell_type",
+                    label = TRUE, repel = TRUE, pt.size = 0.3) +
+  ggtitle("Manual annotation") +
+  theme(legend.position = "bottom")
+
+p_singler <- DimPlot(brain, reduction = "umap",
+                     group.by = "singler_label",
+                     label = TRUE, repel = TRUE, pt.size = 0.3) +
+  ggtitle("SingleR annotation (Darmanis adult brain)") +
+  theme(legend.position = "bottom")
+
+p_manual | p_singler
+```
+
+# 11. Final Annotated UMAP Split by Sample
+
+```{r final-umap, fig.width=14, fig.height=7}
+DimPlot(brain,
+        reduction = "umap",
+        group.by  = "cell_type",
+        split.by  = "sample",
+        label     = TRUE,
+        repel     = TRUE,
+        pt.size   = 0.3) +
+  ggtitle("Final Annotated UMAP – AUD vs Control") +
+  theme(legend.position = "bottom")
+```
+
+```{r final-barplot, fig.height=5}
+prop_df <- as.data.frame(table(brain$cell_type, brain$sample))
+colnames(prop_df) <- c("CellType", "Sample", "Count")
+
+ggplot(prop_df, aes(x = Sample, y = Count, fill = CellType)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Cell type proportions per sample",
+       y = "Proportion", x = "Sample") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 12. Save Seurat Object
+
+```{r save}
+saveRDS(brain,
+        file = "/lustre/home/galanllarimm/bios668/final_project/brain_final.rds")
+cat("Object saved successfully!\n")
+```
+
+# 13. Session Info
+
+```{r session}
+sessionInfo()
+```

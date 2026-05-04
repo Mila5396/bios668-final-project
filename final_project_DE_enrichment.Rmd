@@ -1,0 +1,494 @@
+---
+title: "Final Project – Step 6: Differential Expression & Functional Enrichment"
+author: "Milagros Galán Llario"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 7)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# For functional enrichment
+library(clusterProfiler)
+library(org.Hs.eg.db)   # Human gene annotation database
+library(enrichplot)
+library(ggrepel)        # For volcano plot labels
+```
+
+# 2. Load Seurat Object
+
+We load the previously processed and annotated Seurat object from Step 5.
+This object already contains QC-filtered, SCTransform-normalized, Harmony-integrated,
+and cell-type-annotated data for the two samples (AUD_Sample46 and Control_Sample50).
+
+```{r load-object}
+brain <- readRDS(
+  "/lustre/home/galanllarimm/bios668/final_project/brain_final.rds"
+)
+
+cat("Total cells loaded:", ncol(brain), "\n")
+cat("Samples:\n")
+print(table(brain$sample))
+cat("\nCell type distribution:\n")
+print(sort(table(brain$cell_type), decreasing = TRUE))
+```
+
+# 3. Identify Top 3 Largest Cell Type Clusters
+
+We identify the three most abundant cell types across both samples.
+Differential expression will be performed within each of these cell types,
+comparing AUD versus Control nuclei.
+
+```{r top3-celltypes}
+# Count cells per cell type and sort
+ct_counts <- sort(table(brain$cell_type), decreasing = TRUE)
+
+cat("Cell type sizes (all):\n")
+print(ct_counts)
+
+# Select top 3
+top3_celltypes <- names(ct_counts)[1:3]
+cat("\nTop 3 largest cell types selected for DE analysis:\n")
+for (i in seq_along(top3_celltypes)) {
+  cat(sprintf("  %d. %s (n = %d)\n", i, top3_celltypes[i], ct_counts[top3_celltypes[i]]))
+}
+```
+
+# 4. Differential Expression Analysis
+
+## 4.1 Setup
+
+For differential expression between conditions (AUD vs Control), we need
+to use the **RNA assay** rather than SCT, as recommended by Seurat for
+cross-sample DE testing. We also log-normalize the RNA assay to ensure
+proper scale for the Wilcoxon test.
+
+**Statistical note**: With only one sample per condition (n=1 AUD, n=1 Control),
+pseudobulk approaches (which require biological replicates) are not applicable here.
+We therefore use the Wilcoxon rank-sum test (Seurat default) at the single-cell level.
+Results should be interpreted with caution and treated as exploratory, as individual
+cells within one sample are not independent biological replicates.
+
+```{r de-setup}
+# Switch to RNA assay for DE analysis
+DefaultAssay(brain) <- "RNA"
+
+# Log-normalize the RNA assay (required for Wilcoxon test)
+brain <- NormalizeData(brain, verbose = FALSE)
+
+# Create a combined label: cell_type + condition (e.g. "Oligodendrocytes_AUD")
+brain$celltype.condition <- paste(brain$cell_type, brain$condition, sep = "_")
+
+cat("Combined identity labels (first 10):\n")
+print(head(sort(unique(brain$celltype.condition)), 10))
+```
+
+## 4.2 Run FindMarkers for Each Top Cell Type
+
+For each of the top 3 cell types, we compare AUD (ident.1) vs Control (ident.2).
+Positive log2FC values indicate upregulation in AUD; negative values indicate
+upregulation in Control.
+
+**Mitochondrial gene exclusion**: mitochondrial genes (those with names starting
+with "MT-") are excluded from the DE analysis prior to testing. In snRNA-seq data
+from frozen postmortem tissue, mitochondrial gene expression is heavily influenced
+by the quality of nuclear isolation and the degree of cytoplasmic contamination,
+which can differ substantially between samples due to technical rather than biological
+reasons. In this dataset, Control_Sample50 showed a broader mitochondrial % distribution
+during QC, which required a less stringent threshold than AUD_Sample46. As a consequence,
+mitochondrial genes dominated the DE results and obscured biologically meaningful
+differences. Excluding them upstream of FindMarkers ensures that the DE results
+reflect genuine transcriptional differences between AUD and Control rather than
+technical artifacts of sample quality.
+
+```{r run-de, message=FALSE, warning=FALSE}
+# Set identity to the combined cell type + condition label
+Idents(brain) <- "celltype.condition"
+
+# Define non-mitochondrial genes to test
+# MT- genes are excluded because their differential expression in this dataset
+# reflects QC differences between samples (Control_Sample50 had broader MT%
+# distribution), not true biological differences between AUD and Control.
+non_mito_genes <- rownames(brain)[!grepl("^MT-", rownames(brain))]
+cat(sprintf("Total genes in object: %d | After MT- exclusion: %d | MT- genes removed: %d\n",
+            nrow(brain), length(non_mito_genes), nrow(brain) - length(non_mito_genes)))
+
+# Run DE for each of the top 3 cell types
+de_results <- list()
+
+for (ct in top3_celltypes) {
+  
+  ident1 <- paste0(ct, "_AUD")
+  ident2 <- paste0(ct, "_Control")
+  
+  # Check that both groups exist and have enough cells
+  n1 <- sum(brain$celltype.condition == ident1)
+  n2 <- sum(brain$celltype.condition == ident2)
+  
+  cat(sprintf("\n--- %s: AUD n=%d | Control n=%d ---\n", ct, n1, n2))
+  
+  if (n1 < 10 || n2 < 10) {
+    cat("  Skipping: insufficient cells in one group (<10).\n")
+    next
+  }
+  
+  de <- FindMarkers(
+    brain,
+    ident.1          = ident1,
+    ident.2          = ident2,
+    test.use         = "wilcox",   # Wilcoxon rank-sum test (appropriate for 1 sample/condition)
+    features         = non_mito_genes, # Exclude MT- genes (technical artifact in this dataset)
+    min.pct          = 0.10,       # Gene must be detected in >=10% of cells in either group
+    logfc.threshold  = 0.1,        # Lower threshold to capture modest effects
+    assay            = "RNA",
+    verbose          = FALSE
+  )
+  
+  # Add gene name and cell type as columns
+  de$gene      <- rownames(de)
+  de$cell_type <- ct
+  
+  # Add significance classification
+  de$significance <- "Not significant"
+  de$significance[de$p_val_adj < 0.05 & de$avg_log2FC >  0.25] <- "Up in AUD"
+  de$significance[de$p_val_adj < 0.05 & de$avg_log2FC < -0.25] <- "Up in Control"
+  
+  de_results[[ct]] <- de
+  
+  n_sig <- sum(de$significance != "Not significant")
+  n_up  <- sum(de$significance == "Up in AUD")
+  n_dn  <- sum(de$significance == "Up in Control")
+  cat(sprintf("  Total tested: %d | Significant: %d (Up AUD: %d | Up Control: %d)\n",
+              nrow(de), n_sig, n_up, n_dn))
+}
+```
+
+## 4.3 Summary Table of Significant DE Genes
+
+```{r de-summary}
+# Combine all results and show significant genes
+all_de <- bind_rows(de_results)
+
+sig_de <- all_de %>%
+  filter(significance != "Not significant") %>%
+  arrange(cell_type, p_val_adj) %>%
+  dplyr::select(cell_type, gene, avg_log2FC, pct.1, pct.2, p_val_adj, significance)
+
+cat("Significant DE genes (p_adj < 0.05, |log2FC| > 0.25):\n")
+print(head(sig_de, n = 50))
+
+# Save full DE results to CSV
+write.csv(all_de,
+          file = "/lustre/home/galanllarimm/bios668/final_project/DE_results_top3_celltypes.csv",
+          row.names = FALSE)
+cat("\nFull DE results saved.\n")
+```
+
+# 5. Volcano Plots
+
+Volcano plots show the relationship between effect size (log2FC, x-axis) and
+statistical significance (-log10 adjusted p-value, y-axis). Each point is one gene.
+Red = upregulated in AUD, blue = upregulated in Control, grey = not significant.
+
+```{r volcano-plots, fig.height=6, fig.width=8}
+for (ct in names(de_results)) {
+  
+  de <- de_results[[ct]]
+  
+  # Label top 15 most significant genes
+  top_genes <- de %>%
+    filter(significance != "Not significant") %>%
+    arrange(p_val_adj) %>%
+    slice_head(n = 15)
+  
+  p <- ggplot(de, aes(x = avg_log2FC,
+                      y = -log10(p_val_adj + 1e-300),
+                      color = significance)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(
+      values = c("Up in AUD"      = "#E64B35",
+                 "Up in Control"  = "#4DBBD5",
+                 "Not significant" = "grey70")
+    ) +
+    geom_text_repel(
+      data        = top_genes,
+      aes(label   = gene),
+      size        = 3,
+      max.overlaps = 20,
+      color       = "black"
+    ) +
+    geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(0.05),   linetype = "dashed", color = "grey40") +
+    labs(
+      title    = paste0("Volcano Plot – ", ct),
+      subtitle = "AUD vs Control | Wilcoxon test | padj < 0.05 & |log2FC| > 0.25",
+      x        = "Average log2 Fold Change (AUD / Control)",
+      y        = "-log10(adjusted p-value)",
+      color    = "Direction"
+    ) +
+    theme_classic() +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "grey40"),
+      legend.position = "top"
+    )
+  
+  print(p)
+}
+```
+
+# 6. Functional Enrichment Analysis
+
+## 6.1 Overview
+
+For each of the top 3 cell types, we run two types of enrichment analysis on
+the significant DE genes:
+
+- **GO Biological Process (ORA)**: identifies which biological processes (Gene Ontology
+  terms) are over-represented in our gene list compared to all expressed genes.
+- **KEGG Pathway (ORA)**: identifies which signaling/metabolic pathways are
+  over-represented.
+
+Both use **Over-Representation Analysis (ORA)**, which applies a hypergeometric
+test (equivalent to Fisher's exact test) asking: *"Are genes from pathway X
+more common in my DE list than expected by chance?"*
+
+We perform enrichment separately for **upregulated** (AUD > Control) and
+**downregulated** (AUD < Control) gene sets, since mixing both directions
+can obscure biological interpretation.
+
+## 6.2 GO Biological Process Enrichment
+
+```{r go-enrichment, fig.height=8, fig.width=10}
+go_results <- list()
+
+for (ct in names(de_results)) {
+  
+  de <- de_results[[ct]]
+  
+  # Universe = all genes tested in this cell type
+  universe_genes <- de$gene
+  
+  # Up in AUD
+  up_genes <- de %>%
+    filter(significance == "Up in AUD") %>%
+    pull(gene)
+  
+  # Down in AUD (= up in Control)
+  dn_genes <- de %>%
+    filter(significance == "Up in Control") %>%
+    pull(gene)
+  
+  go_results[[ct]] <- list()
+  
+  for (direction in c("Up_AUD", "Up_Control")) {
+    
+    gene_set <- if (direction == "Up_AUD") up_genes else dn_genes
+    
+    if (length(gene_set) < 5) {
+      cat(sprintf("\n%s – %s: fewer than 5 genes, skipping GO enrichment.\n", ct, direction))
+      next
+    }
+    
+    ego <- tryCatch({
+      enrichGO(
+        gene          = gene_set,
+        universe      = universe_genes,
+        OrgDb         = org.Hs.eg.db,
+        keyType       = "SYMBOL",
+        ont           = "BP",             # Biological Process
+        pAdjustMethod = "BH",
+        pvalueCutoff  = 0.05,
+        qvalueCutoff  = 0.2,
+        readable      = TRUE
+      )
+    }, error = function(e) {
+      cat(sprintf("  GO enrichment failed for %s %s: %s\n", ct, direction, e$message))
+      NULL
+    })
+    
+    if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+      go_results[[ct]][[direction]] <- ego
+      
+      cat(sprintf("\n%s – %s: %d enriched GO:BP terms\n",
+                  ct, direction, nrow(as.data.frame(ego))))
+      
+      # Dotplot
+      p <- dotplot(ego, showCategory = 15, font.size = 9) +
+        ggtitle(paste0("GO:BP – ", ct, " (", gsub("_", " ", direction), ")")) +
+        theme(plot.title = element_text(face = "bold"))
+      print(p)
+      
+    } else {
+      cat(sprintf("\n%s – %s: no enriched GO:BP terms found.\n", ct, direction))
+    }
+  }
+}
+```
+
+## 6.3 KEGG Pathway Enrichment
+
+KEGG requires Entrez gene IDs instead of gene symbols. We use `bitr()` from
+clusterProfiler to convert gene symbols to Entrez IDs before running enrichKEGG().
+
+```{r kegg-enrichment, fig.height=7, fig.width=10}
+kegg_results <- list()
+
+for (ct in names(de_results)) {
+  
+  de <- de_results[[ct]]
+  kegg_results[[ct]] <- list()
+  
+  # Convert universe to Entrez IDs
+  universe_conv <- tryCatch(
+    bitr(de$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db),
+    error = function(e) NULL
+  )
+  
+  if (is.null(universe_conv)) next
+  universe_entrez <- universe_conv$ENTREZID
+  
+  for (direction in c("Up_AUD", "Up_Control")) {
+    
+    gene_set <- de %>%
+      filter(significance == if (direction == "Up_AUD") "Up in AUD" else "Up in Control") %>%
+      pull(gene)
+    
+    if (length(gene_set) < 5) {
+      cat(sprintf("\n%s – %s: fewer than 5 genes, skipping KEGG enrichment.\n", ct, direction))
+      next
+    }
+    
+    # Convert gene symbols to Entrez IDs
+    gene_conv <- tryCatch(
+      bitr(gene_set, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db),
+      error = function(e) NULL
+    )
+    
+    if (is.null(gene_conv) || nrow(gene_conv) == 0) next
+    gene_entrez <- gene_conv$ENTREZID
+    
+    kk <- tryCatch({
+      enrichKEGG(
+        gene          = gene_entrez,
+        universe      = universe_entrez,
+        organism      = "hsa",            # Homo sapiens
+        keyType       = "ncbi-geneid",
+        pAdjustMethod = "BH",
+        pvalueCutoff  = 0.05,
+        qvalueCutoff  = 0.2
+      )
+    }, error = function(e) {
+      cat(sprintf("  KEGG enrichment failed for %s %s: %s\n", ct, direction, e$message))
+      NULL
+    })
+    
+    if (!is.null(kk) && nrow(as.data.frame(kk)) > 0) {
+      
+      # Make gene names readable (convert Entrez → Symbol in output)
+      kk <- setReadable(kk, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      kegg_results[[ct]][[direction]] <- kk
+      
+      cat(sprintf("\n%s – %s: %d enriched KEGG pathways\n",
+                  ct, direction, nrow(as.data.frame(kk))))
+      
+      # Dotplot
+      p <- dotplot(kk, showCategory = 15, font.size = 9) +
+        ggtitle(paste0("KEGG – ", ct, " (", gsub("_", " ", direction), ")")) +
+        theme(plot.title = element_text(face = "bold"))
+      print(p)
+      
+    } else {
+      cat(sprintf("\n%s – %s: no enriched KEGG pathways found.\n", ct, direction))
+    }
+  }
+}
+```
+
+## 6.4 Gene-Concept Network (cnetplot)
+
+The cnetplot shows which specific genes drive each enriched term,
+and which genes belong to multiple terms simultaneously.
+
+```{r cnetplot, fig.height=9, fig.width=11}
+for (ct in names(go_results)) {
+  for (direction in names(go_results[[ct]])) {
+    
+    ego <- go_results[[ct]][[direction]]
+    
+    if (is.null(ego) || nrow(as.data.frame(ego)) == 0) next
+    
+    # Get log2FC values for color coding
+    de <- de_results[[ct]]
+    lfc_vec <- setNames(de$avg_log2FC, de$gene)
+    
+    p <- cnetplot(
+      ego,
+      showCategory  = 5,
+      foldChange    = lfc_vec,
+    ) +
+      ggtitle(paste0("Gene-Concept Network – ", ct,
+                     " (", gsub("_", " ", direction), ")")) +
+      theme(plot.title = element_text(face = "bold"))
+    
+    print(p)
+  }
+}
+```
+
+# 7. Save Enrichment Results
+
+```{r save-enrichment}
+# Save GO results
+for (ct in names(go_results)) {
+  for (direction in names(go_results[[ct]])) {
+    ego <- go_results[[ct]][[direction]]
+    if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+      fname <- paste0(
+        "/lustre/home/galanllarimm/bios668/final_project/GO_BP_",
+        gsub(" ", "_", ct), "_", direction, ".csv"
+      )
+      write.csv(as.data.frame(ego), file = fname, row.names = FALSE)
+      cat("Saved:", fname, "\n")
+    }
+  }
+}
+
+# Save KEGG results
+for (ct in names(kegg_results)) {
+  for (direction in names(kegg_results[[ct]])) {
+    kk <- kegg_results[[ct]][[direction]]
+    if (!is.null(kk) && nrow(as.data.frame(kk)) > 0) {
+      fname <- paste0(
+        "/lustre/home/galanllarimm/bios668/final_project/KEGG_",
+        gsub(" ", "_", ct), "_", direction, ".csv"
+      )
+      write.csv(as.data.frame(kk), file = fname, row.names = FALSE)
+      cat("Saved:", fname, "\n")
+    }
+  }
+}
+
+cat("\nAll enrichment results saved successfully.\n")
+```
+
+# 8. Session Info
+
+```{r session}
+sessionInfo()
+```
